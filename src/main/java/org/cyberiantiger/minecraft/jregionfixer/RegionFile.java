@@ -45,7 +45,7 @@ public class RegionFile implements Closeable {
     private boolean dirty = false;
     private boolean headersLoaded = false;
 
-    private enum ChunkStatus {
+    public enum ChunkStatus {
         INVALID,
         OK,
         NOT_PRESENT

@@ -192,6 +192,11 @@ public class Main {
         try {
             RegionFile regionFile = new RegionFile(region, params.isReadonly());
             try {
+                try {
+                    regionFile.loadHeaders();
+                } catch (IOException ex) {
+                    results.corruptRegionFile(new Chunk(world, region, null, regionFile.getX(), regionFile.getZ()), ex.getMessage(), EnumSet.of(NONE), NONE);
+                }
                 checkRegionFile(world, region, regionFile, results, params);
             } finally {
                 regionFile.close();
