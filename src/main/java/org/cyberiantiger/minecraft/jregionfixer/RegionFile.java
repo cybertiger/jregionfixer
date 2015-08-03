@@ -30,6 +30,7 @@ import org.cyberiantiger.minecraft.nbt.TagInputStream;
 import org.cyberiantiger.minecraft.nbt.TagOutputStream;
 import org.cyberiantiger.minecraft.nbt.TagType;
 import static org.cyberiantiger.minecraft.jregionfixer.ErrorAction.*;
+import org.cyberiantiger.minecraft.nbt.TagTuple;
 
 /**
  *
@@ -183,7 +184,7 @@ NEXT_CHUNK:
                         continue NEXT_CHUNK;
                 }
                 try {
-                    Tag data = in.readTag();
+                    Tag data = in.readTag().getValue();
                     if (data.getType() != TagType.COMPOUND) {
                         results.corruptChunk(chunk, "Chunk data not a compound", EnumSet.of(NONE), NONE);
                         // Fatal, no point performing further checks.
@@ -322,7 +323,7 @@ NEXT_CHUNK:
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         TagOutputStream tagOut = new TagOutputStream(new DeflaterOutputStream(out));
         try {
-            tagOut.writeTag(tag);
+            tagOut.writeTag(new TagTuple<Tag>("", tag));
         } finally {
             tagOut.close();
         }
