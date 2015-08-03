@@ -6,37 +6,31 @@ package org.cyberiantiger.minecraft.jregionfixer;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
-import java.util.EnumSet;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.DeflaterOutputStream;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.InflaterInputStream;
-import org.cyberiantiger.minecraft.nbt.CompoundTag;
-import org.cyberiantiger.minecraft.nbt.ListTag;
 import org.cyberiantiger.minecraft.nbt.Tag;
 import org.cyberiantiger.minecraft.nbt.TagInputStream;
 import org.cyberiantiger.minecraft.nbt.TagOutputStream;
-import org.cyberiantiger.minecraft.nbt.TagType;
-import static org.cyberiantiger.minecraft.jregionfixer.ErrorAction.*;
 import org.cyberiantiger.minecraft.nbt.TagTuple;
 
 /**
  *
  * @author antony
  */
-public class RegionFile {
+public class RegionFile implements Closeable {
     public static final Pattern REGION_FILE = Pattern.compile("r.(-?[0-9]+).(-?[0-9]+).mca");
     private static final int BLOCK_SIZE = 4096;
     private final File world;
@@ -51,6 +45,7 @@ public class RegionFile {
     private final List<ChunkOffset> fileMap = new ArrayList<ChunkOffset>();
     private final Map<ChunkOffset, ChunkStatus> chunkStatus = new HashMap<ChunkOffset, ChunkStatus>();
     private boolean dirty = false;
+    private boolean headersLoaded = false;
 
     private enum ChunkStatus {
         INVALID,
@@ -130,8 +125,18 @@ public class RegionFile {
                 }
             }
         }
+        headersLoaded = true;
     }
 
+    public boolean isHeadersLoaded() {
+        return headersLoaded;
+    }
+
+    public boolean isDirty() {
+        return dirty;
+    }
+
+    @Override
     public void close() throws IOException {
         if (dirty) {
             fd.seek(0);
@@ -140,7 +145,133 @@ public class RegionFile {
         fd.close();
     }
 
+    public ChunkStatus getChunkStatus(ChunkOffset offset) {
+        return chunkStatus.get(offset);
+    }
 
+    public void deleteChunk(ChunkOffset offset) throws IOException {
+        if (params.isReadonly()) throw new IOException("Readonly");
+        dirty = true;
+        header.put(offset.getOffset(), 0);
+        header.put(1024 + offset.getOffset(), 0);
+        chunkStatus.put(offset, ChunkStatus.NOT_PRESENT);
+        for (int i = 0; i < fileMap.size(); i++) {
+            if (offset.equals(fileMap.get(i))) {
+                fileMap.set(i, null);
+            }
+        }
+    }
+
+    public void writeChunk(ChunkOffset offset, Tag tag) throws IOException {
+        if (!isHeadersLoaded()) throw new IllegalStateException();
+        if (params.isReadonly()) throw new IOException("Readonly");
+        dirty = true;
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        TagOutputStream tagOut = new TagOutputStream(new DeflaterOutputStream(out));
+        try {
+            tagOut.writeTag(new TagTuple<Tag>("", tag));
+        } finally {
+            tagOut.close();
+        }
+        byte[] data = out.toByteArray();
+        long fileOffset = 0L;
+        int dataLength = data.length + 5; // Length of data including header.
+        int blockLength = ((dataLength-1)>>12) + 1; // Length of data in 4k blocks.
+        // Attempt to reuse existing offset.
+        if (chunkStatus.get(offset) == ChunkStatus.OK) {
+            int location = header.get(offset.getOffset());
+            if (blockLength <= (location & 0xff)) {
+                fileOffset = (location & 0xFFFFFF00L)<<4;
+            }
+        }
+        // (Re)allocation file location to save chunk.
+        if (fileOffset == 0L) {
+            int location = allocateChunk(offset, ((data.length+4)>>12) + 1 );
+            fileOffset = (location & 0xFFFFFF00L)<<4;
+            header.put(offset.getOffset(), location);
+        }
+        header.put(offset.getOffset()+1024, (int)System.currentTimeMillis() / 1000); // Y2k38 bug.
+        dirty = true;
+        fd.seek(fileOffset);
+        fd.writeInt(data.length);
+        fd.write(2);
+        fd.write(data);
+        chunkStatus.put(offset, ChunkStatus.OK);
+    }
+
+    public Tag readChunk(ChunkOffset offset) throws IOException {
+        if (!isHeadersLoaded()) throw new IllegalStateException();
+        ChunkStatus status = getChunkStatus(offset);
+        switch (status) {
+            case INVALID:
+                throw new CorruptChunkException("Chunk entry in header was invalid");
+            case NOT_PRESENT:
+                return null;
+        }
+        int location = header.get(offset.getOffset());
+        long fileOffset = (location & 0xFFFFFF00L)<<4;
+        int chunkLength = (location & 0xFF) << 12;
+        if (fileOffset + 5 >= fd.length()) {
+            throw new CorruptChunkException("Chunk data is located beyond the end of the file.");
+        }
+        fd.seek(fileOffset);
+        int actualLength = fd.readInt();
+        int compression = fd.read();
+        if (actualLength + 5 > chunkLength) {
+            throw new CorruptChunkException("Chunk length exceeds file length in header");
+        }
+        if (fd.getFilePointer() + actualLength > fd.length()) {
+            throw new CorruptChunkException("Chunk data is located beyond the end of file.");
+        }
+        TagInputStream in;
+        switch (compression) {
+            case 1:
+                in = new TagInputStream(new GZIPInputStream(new BufferedInputStream(new RandomAccessFileInputStream(fd, actualLength))));
+                break;
+            case 2:
+                in = new TagInputStream(new InflaterInputStream(new BufferedInputStream(new RandomAccessFileInputStream(fd, actualLength))));
+                break;
+            default:
+                throw new CorruptChunkException("Chunk data contains invalid compression type: " + compression);
+        }
+        return in.readTag().getValue();
+    }
+
+    private int allocateChunk(ChunkOffset chunkOffset, int size) {
+        int freeCount = 0;
+        if (chunkStatus.get(chunkOffset) == ChunkStatus.OK) {
+            int location = header.get(chunkOffset.getOffset());
+            int offset = (location >> 8) & 0xffffff;
+            int maxOffset = offset + (location & 0xff);
+            for (int i = offset; i < maxOffset; i++) {
+                fileMap.set(i, null);
+            }
+        }
+        for (int i = 2; i < fileMap.size(); i++) {
+            ChunkOffset offset = fileMap.get(i);
+            if (offset == null) {
+                freeCount++;
+            } else {
+                freeCount = 0;
+            }
+            if (freeCount >= size) {
+                for (int j = 1; j <= freeCount; j++) {
+                    fileMap.set(i-j, chunkOffset);
+                }
+                return ((i-freeCount) << 8) | size;
+            }
+        }
+        for (int i = 1; i <= freeCount; i++) {
+            fileMap.set(fileMap.size() - i, chunkOffset);
+        }
+        while (freeCount < size) {
+            freeCount++;
+            fileMap.add(chunkOffset);
+        }
+        return ((fileMap.size() - freeCount)<<8) | size;
+    }
+
+    /*
     private void checkChunkData() {
 NEXT_CHUNK:
         for (int i = 0; i < 1024; i++) {
@@ -269,86 +400,5 @@ NEXT_CHUNK:
             }
         }
     }
-
-    private int allocateChunk(ChunkOffset chunkOffset, int size) {
-        int freeCount = 0;
-        if (chunkStatus.get(chunkOffset) == ChunkStatus.OK) {
-            int location = header.get(chunkOffset.getOffset());
-            int offset = (location >> 8) & 0xffffff;
-            int maxOffset = offset + (location & 0xff);
-            for (int i = offset; i < maxOffset; i++) {
-                fileMap.set(i, null);
-            }
-        }
-        for (int i = 2; i < fileMap.size(); i++) {
-            ChunkOffset offset = fileMap.get(i);
-            if (offset == null) {
-                freeCount++;
-            } else {
-                freeCount = 0;
-            }
-            if (freeCount >= size) {
-                for (int j = 1; j <= freeCount; j++) {
-                    fileMap.set(i-j, chunkOffset);
-                }
-                return ((i-freeCount) << 8) | size;
-            }
-        }
-        for (int i = 1; i <= freeCount; i++) {
-            fileMap.set(fileMap.size() - i, chunkOffset);
-        }
-        while (freeCount < size) {
-            freeCount++;
-            fileMap.add(chunkOffset);
-        }
-        return ((fileMap.size() - freeCount)<<8) | size;
-    }
-
-    public void deleteChunk(ChunkOffset offset) throws IOException {
-        if (params.isReadonly()) throw new IOException("Readonly");
-        dirty = true;
-        header.put(offset.getOffset(), 0);
-        header.put(1024 + offset.getOffset(), 0);
-        chunkStatus.put(offset, ChunkStatus.NOT_PRESENT);
-        for (int i = 0; i < fileMap.size(); i++) {
-            if (offset.equals(fileMap.get(i))) {
-                fileMap.set(i, null);
-            }
-        }
-    }
-
-    public void writeChunk(ChunkOffset offset, Tag tag) throws IOException {
-        if (params.isReadonly()) throw new IOException("Readonly");
-        dirty = true;
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        TagOutputStream tagOut = new TagOutputStream(new DeflaterOutputStream(out));
-        try {
-            tagOut.writeTag(new TagTuple<Tag>("", tag));
-        } finally {
-            tagOut.close();
-        }
-        byte[] data = out.toByteArray();
-        long fileOffset = 0L;
-        int dataLength = data.length + 5; // Length of data including header.
-        int blockLength = ((dataLength-1)>>12) + 1; // Length of data in 4k blocks.
-        // Attempt to reuse existing offset.
-        if (chunkStatus.get(offset) == ChunkStatus.OK) {
-            int location = header.get(offset.getOffset());
-            if (blockLength <= (location & 0xff)) {
-                fileOffset = (location & 0xFFFFFF00L)<<4;
-            }
-        }
-        // (Re)allocation file location to save chunk.
-        if (fileOffset == 0L) {
-            int location = allocateChunk(offset, ((data.length+4)>>12) + 1 );
-            fileOffset = (location & 0xFFFFFF00L)<<4;
-            header.put(offset.getOffset(), location);
-        }
-        //header.put(offset.getOffset()+1024, timeStamp);
-        fd.seek(fileOffset);
-        fd.writeInt(data.length);
-        fd.write(2);
-        fd.write(data);
-        chunkStatus.put(offset, ChunkStatus.OK);
-    }
+    */
 }
