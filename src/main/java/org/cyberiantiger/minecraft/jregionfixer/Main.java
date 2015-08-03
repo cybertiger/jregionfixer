@@ -7,10 +7,16 @@ package org.cyberiantiger.minecraft.jregionfixer;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.Charset;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import static org.cyberiantiger.minecraft.jregionfixer.ErrorAction.*;
+import org.cyberiantiger.minecraft.nbt.CompoundTag;
+import org.cyberiantiger.minecraft.nbt.ListTag;
+import org.cyberiantiger.minecraft.nbt.Tag;
+import org.cyberiantiger.minecraft.nbt.TagType;
 
 /**
  *
@@ -171,9 +177,6 @@ public class Main {
                 if (params.isVerbose(1)) System.err.println("Skipping " + file.getPath() + " - count not find any region directories");
             }
         }
-        if (params.isReadonly()) {
-            return;
-        }
     }
 
     private static void checkRegionFiles(File world, File region, DefaultErrorHandler results, CheckParameters params) {
@@ -187,14 +190,114 @@ public class Main {
 
     private static void checkRegionFile(File world, File region, DefaultErrorHandler results, CheckParameters params) {
         try {
-            RegionFile regionFile = new RegionFile(world, region, results, params);
+            RegionFile regionFile = new RegionFile(region, params.isReadonly());
             try {
-                regionFile.performChecks();
+                checkRegionFile(world, region, regionFile, results, params);
             } finally {
                 regionFile.close();
             }
         } catch (IOException ex) {
             if (params.isVerbose(1)) ex.printStackTrace(System.err);
+        }
+    }
+    
+    private static void checkRegionFile(File world, File region, RegionFile regionFile, DefaultErrorHandler results, CheckParameters params) {
+        for (int i = 0; i < 1024; i++) {
+            ChunkOffset offset = new ChunkOffset(i);
+            Chunk chunk = new Chunk(world, region, offset, regionFile.getX(), regionFile.getZ());
+            switch (regionFile.getChunkStatus(offset)) {
+                case NOT_PRESENT:
+                    break;
+                case INVALID:
+                    results.corruptChunk(chunk, "Region file header had corrupt chunk offset", EnumSet.of(NONE), NONE);
+                    break;
+                case OK:
+                    try {
+                        checkChunk(chunk, regionFile.readChunk(offset), results, params);
+                    } catch (IOException ex) {
+                        results.corruptChunk(chunk, ex.getMessage(), EnumSet.of(NONE), NONE);
+                    }
+                    break;
+            }
+        }
+    }
+
+    private static void checkChunk(Chunk chunk, Tag data, DefaultErrorHandler results, CheckParameters params) {
+        if (data.getType() != TagType.COMPOUND) {
+            results.corruptChunk(chunk, "Chunk data not a compound", EnumSet.of(NONE), NONE);
+            // Fatal, no point performing further checks.
+            return;
+        }
+        CompoundTag dataC = (CompoundTag) data;
+        if (!dataC.containsKey("Level", TagType.COMPOUND)) {
+            results.corruptChunk(chunk, "Chunk data missing \"Level\" compound.", EnumSet.of(NONE), NONE);
+            // Fatal, no point performing further checks.
+            return;
+        }
+        CompoundTag level = dataC.getCompound("Level");
+        if (!level.containsKey("xPos", TagType.INT)) {
+            results.invalidXPosition(chunk, "xPos tag missing or wrong type.", EnumSet.of(NONE), NONE);
+        }
+        if (level.getInt("xPos") != chunk.getX()) {
+            results.invalidXPosition(chunk, "xPos: " + level.getInt("xPos") + " does not match expected xPos: " + chunk.getX(), EnumSet.of(NONE), NONE);
+        }
+        if (!level.containsKey("zPos", TagType.INT)) {
+            results.invalidZPosition(chunk, "zPos tag missing or wrong type.", EnumSet.of(NONE), NONE);
+        }
+        if (level.getInt("zPos") != chunk.getZ()) {
+            results.invalidZPosition(chunk, "zPos: " + level.getInt("zPos") + " does not match expected zPos: " + chunk.getZ(), EnumSet.of(NONE), NONE);
+        }
+        if (!level.containsKey("Entities", TagType.LIST)) {
+            results.invalidEntities(chunk, "Entities tag missing or wrong type.", EnumSet.of(NONE), NONE);
+        }
+        if (params.isCheckEntityCount()) {
+            ListTag entities = level.getList("Entities");
+            if (!entities.isEmpty()) {
+                if (entities.getListType() != TagType.COMPOUND) {
+                    results.invalidEntities(chunk, "Entities are wrong type: " + entities.getListType().name(), EnumSet.of(NONE), NONE);
+                } else if (entities.size() > params.getMaxEntities()) {
+                    results.tooManyEntities(chunk, "Found " + entities.size() + " entities", EnumSet.of(NONE), NONE);
+                }
+            }
+        }
+        if (!level.containsKey("TileEntities", TagType.LIST)) {
+            results.invalidTileEntities(chunk, "TileEntities tag missing or wrong type.", EnumSet.of(NONE), NONE);
+        } else if (params.isCheckTileEntityCount() || params.isCheckTileEntityLocation()) {
+            ListTag tileEntities = level.getList("TileEntities");
+            if (!tileEntities.isEmpty() && tileEntities.getListType() != TagType.COMPOUND) {
+                results.invalidTileEntities(chunk, "TileEntities are wrong type: " + tileEntities.getListType().name(), EnumSet.of(NONE), NONE);
+            } else {
+                if (params.isCheckTileEntityCount() && tileEntities.size() > params.getMaxTileEntities()) {
+                    results.tooManyTileEntities(chunk, "Found " + tileEntities.size() + " tile entities", EnumSet.of(NONE), NONE);
+                }
+                if (params.isCheckTileEntityLocation()) {
+                    if (!tileEntities.isEmpty()) {
+                        for (CompoundTag tileEntity : (CompoundTag[]) tileEntities.getValue()) {
+                            if (!tileEntity.containsKey("x", TagType.INT)) {
+                                results.invalidTileEntity(chunk, "Invalid tile entity, no x position", EnumSet.of(NONE), NONE);
+                                break;
+                            }
+                            if (!tileEntity.containsKey("y", TagType.INT)) {
+                                results.invalidTileEntity(chunk, "Invalid tile entity, no y position", EnumSet.of(NONE), NONE);
+                                break;
+                            }
+                            if (!tileEntity.containsKey("z", TagType.INT)) {
+                                results.invalidTileEntity(chunk, "Invalid tile entity, no z position", EnumSet.of(NONE), NONE);
+                                break;
+                            }
+                            int x = tileEntity.getInt("x");
+                            int y = tileEntity.getInt("y");
+                            int z = tileEntity.getInt("z");
+                            int chunkX = x - chunk.getX();
+                            int chunkZ = z - chunk.getZ();
+                            if (chunkX < 0 || chunkX > 15 || chunkZ < 0 || chunkZ > 15 || y < 0 || y > 255) {
+                                results.misplacedTileEntity(chunk, "Invalid tile entity, located outside chunk, relative offset: " + chunkX + ", " + y + ", " + chunkZ, EnumSet.of(NONE), NONE);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

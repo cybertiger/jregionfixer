@@ -33,10 +33,8 @@ import org.cyberiantiger.minecraft.nbt.TagTuple;
 public class RegionFile implements Closeable {
     public static final Pattern REGION_FILE = Pattern.compile("r.(-?[0-9]+).(-?[0-9]+).mca");
     private static final int BLOCK_SIZE = 4096;
-    private final File world;
     private final File file;
-    private final ErrorHandler results;
-    private final CheckParameters params;
+    private boolean readOnly;
     private final RandomAccessFile fd;
     private final byte[] headerArray;
     private final IntBuffer header;
@@ -53,12 +51,9 @@ public class RegionFile implements Closeable {
         NOT_PRESENT
     }
 
-    public RegionFile(File world, File file, ErrorHandler results, CheckParameters params) throws IOException {
-        this.world = world;
+    public RegionFile(File file, boolean readOnly) throws IOException {
         this.file = file;
-        this.results = results;
-        this.params = params;
-        this.fd = new RandomAccessFile(file, params.isReadonly() ?  "r" : "rw");
+        this.fd = new RandomAccessFile(file, readOnly ?  "r" : "rw");
         this.headerArray = new byte[8096];
         this.header = ByteBuffer.wrap(headerArray).asIntBuffer();
         Matcher m = REGION_FILE.matcher(file.getName());
@@ -71,6 +66,14 @@ public class RegionFile implements Closeable {
         } catch (NumberFormatException ex) {
             throw new IOException("Invalid region filename: " + file.getName());
         }
+    }
+
+    public int getX() {
+        return x;
+    }
+
+    public int getZ() {
+        return z;
     }
 
     public void loadHeaders() throws IOException {
@@ -128,6 +131,10 @@ public class RegionFile implements Closeable {
         headersLoaded = true;
     }
 
+    public boolean isReadOnly() {
+        return readOnly;
+    }
+
     public boolean isHeadersLoaded() {
         return headersLoaded;
     }
@@ -150,7 +157,7 @@ public class RegionFile implements Closeable {
     }
 
     public void deleteChunk(ChunkOffset offset) throws IOException {
-        if (params.isReadonly()) throw new IOException("Readonly");
+        if (isReadOnly()) throw new IOException("Readonly");
         dirty = true;
         header.put(offset.getOffset(), 0);
         header.put(1024 + offset.getOffset(), 0);
@@ -162,9 +169,24 @@ public class RegionFile implements Closeable {
         }
     }
 
-    public void writeChunk(ChunkOffset offset, Tag tag) throws IOException {
+    public void truncate() throws IOException {
+        if (isReadOnly()) throw new IOException("Readonly");
+        int i = fileMap.size();
+        while (--i >= 2) {
+            if (fileMap.get(i) == null) {
+                fileMap.remove(i);
+            } else {
+                break;
+            }
+        }
+        if (fd.length() > fileMap.size() * BLOCK_SIZE) {
+            fd.setLength(fileMap.size() * BLOCK_SIZE);
+        }
+    }
+
+    public void writeGzipChunk(ChunkOffset offset, Tag tag) throws IOException {
         if (!isHeadersLoaded()) throw new IllegalStateException();
-        if (params.isReadonly()) throw new IOException("Readonly");
+        if (isReadOnly()) throw new IOException("Readonly");
         dirty = true;
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         TagOutputStream tagOut = new TagOutputStream(new DeflaterOutputStream(out));
@@ -174,6 +196,25 @@ public class RegionFile implements Closeable {
             tagOut.close();
         }
         byte[] data = out.toByteArray();
+        writeChunkData(offset, data, (byte)1);
+    }
+
+    public void writeDeflateChunk(ChunkOffset offset, Tag tag, int deflateType) throws IOException {
+        if (!isHeadersLoaded()) throw new IllegalStateException();
+        if (isReadOnly()) throw new IOException("Readonly");
+        dirty = true;
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        TagOutputStream tagOut = new TagOutputStream(new DeflaterOutputStream(out));
+        try {
+            tagOut.writeTag(new TagTuple<Tag>("", tag));
+        } finally {
+            tagOut.close();
+        }
+        byte[] data = out.toByteArray();
+        writeChunkData(offset, data, (byte)2);
+    }
+
+    private void writeChunkData(ChunkOffset offset, byte[] data, byte compression) throws IOException {
         long fileOffset = 0L;
         int dataLength = data.length + 5; // Length of data including header.
         int blockLength = ((dataLength-1)>>12) + 1; // Length of data in 4k blocks.
@@ -191,10 +232,9 @@ public class RegionFile implements Closeable {
             header.put(offset.getOffset(), location);
         }
         header.put(offset.getOffset()+1024, (int)System.currentTimeMillis() / 1000); // Y2k38 bug.
-        dirty = true;
         fd.seek(fileOffset);
         fd.writeInt(data.length);
-        fd.write(2);
+        fd.write(compression);
         fd.write(data);
         chunkStatus.put(offset, ChunkStatus.OK);
     }
@@ -271,134 +311,4 @@ public class RegionFile implements Closeable {
         return ((fileMap.size() - freeCount)<<8) | size;
     }
 
-    /*
-    private void checkChunkData() {
-NEXT_CHUNK:
-        for (int i = 0; i < 1024; i++) {
-            int location = header.get(i);
-            if (location == 0) {
-                continue;
-            }
-
-            ChunkOffset chunkOffset = new ChunkOffset(i);
-            Chunk chunk = new Chunk(world, file, chunkOffset, x, z);
-
-            long fileOffset = (location & 0xFFFFFF00L)<<4;
-            int chunkLength = (location & 0xFF) << 12;
-
-            try {
-                if (fileOffset + 5 >= fd.length()) {
-                    results.corruptChunk(chunk, "Chunk data is located beyond the end of file.", EnumSet.of(NONE), NONE);
-                    continue;
-                }
-                fd.seek(fileOffset);
-                int actualLength = fd.readInt();
-                int compression = fd.read();
-                if (actualLength + 5 > chunkLength) {
-                    results.corruptChunk(chunk, "Chunk length exceeds file length in header", EnumSet.of(NONE), NONE);
-                    continue;
-                }
-                if (fd.getFilePointer() + actualLength > fd.length()) {
-                    results.corruptChunk(chunk, "Chunk data is located beyond the end of file.", EnumSet.of(NONE), NONE);
-                    continue;
-                }
-                TagInputStream in;
-                switch (compression) {
-                    case 1:
-                        in = new TagInputStream(new GZIPInputStream(new BufferedInputStream(new RandomAccessFileInputStream(fd, actualLength))));
-                        break;
-                    case 2:
-                        in = new TagInputStream(new InflaterInputStream(new BufferedInputStream(new RandomAccessFileInputStream(fd, actualLength))));
-                        break;
-                    default:
-                        results.corruptChunk(chunk, "Chunk data contains invalid compression type: " + compression, EnumSet.of(NONE), NONE);
-                        continue NEXT_CHUNK;
-                }
-                try {
-                    Tag data = in.readTag().getValue();
-                    if (data.getType() != TagType.COMPOUND) {
-                        results.corruptChunk(chunk, "Chunk data not a compound", EnumSet.of(NONE), NONE);
-                        // Fatal, no point performing further checks.
-                        continue NEXT_CHUNK;
-                    }
-                    CompoundTag dataC = (CompoundTag) data;
-                    if (!dataC.containsKey("Level", TagType.COMPOUND)) {
-                        results.corruptChunk(chunk, "Chunk data missing \"Level\" compound.", EnumSet.of(NONE), NONE);
-                        // Fatal, no point performing further checks.
-                        continue NEXT_CHUNK;
-                    }
-                    CompoundTag level = dataC.getCompound("Level");
-                    if (!level.containsKey("xPos", TagType.INT)) {
-                        results.invalidXPosition(chunk, "xPos tag missing or wrong type.", EnumSet.of(NONE), NONE);
-                    }
-                    if (level.getInt("xPos") != chunk.getX()) {
-                        results.invalidXPosition(chunk, "xPos: " + level.getInt("xPos") + " does not match expected xPos: " + chunk.getX(), EnumSet.of(NONE), NONE);
-                    }
-                    if (!level.containsKey("zPos", TagType.INT)) {
-                        results.invalidZPosition(chunk, "zPos tag missing or wrong type.", EnumSet.of(NONE), NONE);
-                    }
-                    if (level.getInt("zPos") != chunk.getZ()) {
-                        results.invalidZPosition(chunk, "zPos: " + level.getInt("zPos") + " does not match expected zPos: " + z, EnumSet.of(NONE), NONE);
-                    }
-                    if (!level.containsKey("Entities", TagType.LIST)) {
-                        results.invalidEntities(chunk, "Entities tag missing or wrong type.", EnumSet.of(NONE), NONE);
-                    }
-                    if (params.isCheckEntityCount()) {
-                        ListTag entities = level.getList("Entities");
-                        if (!entities.isEmpty()) {
-                            if (entities.getListType() != TagType.COMPOUND) {
-                                results.invalidEntities(chunk, "Entities are wrong type: " + entities.getListType().name(), EnumSet.of(NONE), NONE);
-                            } else if (entities.size() > params.getMaxEntities()) {
-                                results.tooManyEntities(chunk, "Found " + entities.size() + " entities", EnumSet.of(NONE), NONE);
-                            }
-                        }
-                    }
-                    if (!level.containsKey("TileEntities", TagType.LIST)) {
-                        results.invalidTileEntities(chunk, "TileEntities tag missing or wrong type.", EnumSet.of(NONE), NONE);
-                    } else if (params.isCheckTileEntityCount() || params.isCheckTileEntityLocation()) {
-                        ListTag tileEntities = level.getList("TileEntities");
-                        if (!tileEntities.isEmpty() && tileEntities.getListType() != TagType.COMPOUND) {
-                            results.invalidTileEntities(chunk, "TileEntities are wrong type: " + tileEntities.getListType().name(), EnumSet.of(NONE), NONE);
-                        } else {
-                            if (params.isCheckTileEntityCount() && tileEntities.size() > params.getMaxTileEntities()) {
-                                results.tooManyTileEntities(chunk, "Found " + tileEntities.size() + " tile entities", EnumSet.of(NONE), NONE);
-                            }
-                            if (params.isCheckTileEntityLocation()) {
-                                if (!tileEntities.isEmpty()) {
-                                    for (CompoundTag tileEntity : (CompoundTag[]) tileEntities.getValue()) {
-                                        if (!tileEntity.containsKey("x", TagType.INT)) {
-                                            results.invalidTileEntity(chunk, "Invalid tile entity, no x position", EnumSet.of(NONE), NONE);
-                                            break;
-                                        }
-                                        if (!tileEntity.containsKey("y", TagType.INT)) {
-                                            results.invalidTileEntity(chunk, "Invalid tile entity, no y position", EnumSet.of(NONE), NONE);
-                                            break;
-                                        }
-                                        if (!tileEntity.containsKey("z", TagType.INT)) {
-                                            results.invalidTileEntity(chunk, "Invalid tile entity, no z position", EnumSet.of(NONE), NONE);
-                                            break;
-                                        }
-                                        int x = tileEntity.getInt("x");
-                                        int y = tileEntity.getInt("y");
-                                        int z = tileEntity.getInt("z");
-                                        int chunkX = x - chunk.getX();
-                                        int chunkZ = z - chunk.getZ();
-                                        if (chunkX < 0 || chunkX > 15 || chunkZ < 0 || chunkZ > 15 || y < 0 || y > 255) {
-                                            results.misplacedTileEntity(chunk, "Invalid tile entity, located outside chunk, relative offset: " + chunkX + ", " + y + ", " + chunkZ, EnumSet.of(NONE), NONE);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } finally {
-                    in.close();
-                }
-            } catch (IOException e) {
-                results.corruptChunk(chunk, "Exception parsing tag data: " + e.getClass().getName() + ": " + e.getMessage(), EnumSet.of(NONE), NONE);
-            }
-        }
-    }
-    */
 }
