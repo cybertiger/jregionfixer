@@ -53,7 +53,6 @@ public class RegionFile implements Closeable {
 
     public RegionFile(File file, boolean readOnly) throws IOException {
         this.file = file;
-        this.fd = new RandomAccessFile(file, readOnly ?  "r" : "rw");
         this.headerArray = new byte[8096];
         this.header = ByteBuffer.wrap(headerArray).asIntBuffer();
         Matcher m = REGION_FILE.matcher(file.getName());
@@ -66,6 +65,7 @@ public class RegionFile implements Closeable {
         } catch (NumberFormatException ex) {
             throw new IOException("Invalid region filename: " + file.getName());
         }
+        this.fd = new RandomAccessFile(file, readOnly ?  "r" : "rw");
     }
 
     public int getX() {
